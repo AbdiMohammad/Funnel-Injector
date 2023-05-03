@@ -13,13 +13,13 @@ import torch.nn as nn
 import torch
 
 @torch.no_grad()
-def count_ops_and_params(model, example_inputs):
+def count_ops_and_params(model, example_inputs, ignore_modules=[]):
     global CUSTOM_MODULES_MAPPING
-    model = copy.deepcopy(model)
+    # model = copy.deepcopy(model)
     flops_model = add_flops_counting_methods(model)
     flops_model.eval()
     flops_model.start_flops_count(ost=sys.stdout, verbose=False,
-                                  ignore_list=[])
+                                  ignore_list=ignore_modules)
     if isinstance(example_inputs, (tuple, list)):
         _ = flops_model(*example_inputs)
     else:
@@ -313,6 +313,16 @@ def accumulate_flops(self):
         return sum
 
 
+def accumulate_params(self):
+    if is_supported_instance(self):
+        return self.__params__
+    else:
+        sum = 0
+        for m in self.children():
+            sum += m.accumulate_params()
+        return sum
+
+
 def get_model_parameters_number(model):
     params_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return params_num
@@ -348,7 +358,16 @@ def compute_average_flops_cost(self):
         if hasattr(m, 'accumulate_flops'):
             del m.accumulate_flops
 
-    params_sum = get_model_parameters_number(self)
+    for m in self.modules():
+        m.accumulate_params = accumulate_params.__get__(m)
+
+    params_sum = self.accumulate_params()
+
+    for m in self.modules():
+        if hasattr(m, 'accumulate_params'):
+            del m.accumulate_params
+
+    # params_sum = get_model_parameters_number(self)
     return flops_sum / self.__batch_counter__, params_sum
 
 
@@ -364,9 +383,9 @@ def start_flops_count(self, **kwargs):
     seen_types = set()
 
     def add_flops_counter_hook_function(module, ost, verbose, ignore_list):
-        if type(module) in ignore_list:
-            seen_types.add(type(module))
+        if module in ignore_list:
             if is_supported_instance(module):
+                seen_types.add(type(module))
                 module.__params__ = 0
         elif is_supported_instance(module):
             if hasattr(module, '__flops_handle__'):
