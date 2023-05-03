@@ -1,4 +1,3 @@
-from pickletools import optimize
 import torch.nn as nn
 from enum import IntEnum
 
@@ -17,30 +16,41 @@ class _CustomizedOp(nn.Module):
 
 
 class _ConcatOp(nn.Module):
-    def __init__(self):
+    def __init__(self, id):
         super(_ConcatOp, self).__init__()
         self.offsets = None
+        self.concat_sizes = None
+        self.id = id
 
     def __repr__(self):
-        return "_ConcatOp({})".format(self.offsets)
+        return "_ConcatOp_{}({})".format(self.id, self.offsets)
 
 
 class _SplitOp(nn.Module):
-    def __init__(self):
+    def __init__(self, id):
         super(_SplitOp, self).__init__()
         self.offsets = None
+        self.split_sizes = None  
+        self.id = id
 
     def __repr__(self):
-        return "_SplitOp({})".format(self.offsets)
+        return "_SplitOp_{}({})".format(self.id,self.offsets)
+
+class _ReshapeOp(nn.Module):
+    def __init__(self, id):
+        super(_ReshapeOp, self).__init__()
+        self.id = id
+    def __repr__(self):
+        return "_Reshape_{}()".format(self.id)
 
 
 class _ElementWiseOp(nn.Module):
-    def __init__(self, grad_fn):
+    def __init__(self, id, grad_fn):
         super(_ElementWiseOp, self).__init__()
         self._grad_fn = grad_fn
-
+        self.id = id
     def __repr__(self):
-        return "_ElementWiseOp({})".format(self._grad_fn)
+        return "_ElementWiseOp_{}({})".format(self.id, self._grad_fn)
 
 
 ######################################################
@@ -62,12 +72,58 @@ class DummyPruner(object):
 
 
 class ConcatPruner(DummyPruner):
-    pass
+    def prune_out_channels(self, layer, idxs):
+        if layer.concat_sizes is None:
+            return
+        new_concat_sizes = layer.concat_sizes.copy()
+        concat_sizes = layer.concat_sizes
+        offsets = [0]
+        for i in range(len(concat_sizes)):
+            offsets.append(offsets[i] + concat_sizes[i])
+        for idx in idxs: # find the ID of the concat
+            for i in range(len(offsets)-1):
+                if idx >= offsets[i] and idx < offsets[i+1]:
+                    concat_sizes[i] -= 1
+                    break
+            new_concat_sizes[i]-=1
+        layer.concat_sizes = new_concat_sizes
+        offsets = [0]
+        for i in range(len(new_concat_sizes)):
+            offsets.append(offsets[i] + new_concat_sizes[i])
+        self.offsets = offsets
+
+    prune_in_channels = prune_out_channels
 
 
 class SplitPruner(DummyPruner):
-    pass
+    def prune_out_channels(self, layer, idxs):
+        if layer.split_sizes is None:
+            return
+        new_split_sizes = layer.split_sizes.copy()
+        split_sizes = layer.split_sizes
+        #offsets = layer.offsets
+        # accumulate split_sizes
+        offsets = [0]
+        for i in range(len(split_sizes)):
+            offsets.append(offsets[i] + split_sizes[i])
+        for idx in idxs: # find the ID of the split
+            for i in range(len(offsets)-1):
+                if idx >= offsets[i] and idx < offsets[i+1]:
+                    split_sizes[i] -= 1
+                    break
+            new_split_sizes[i]-=1
+        layer.split_sizes = new_split_sizes
+        offsets = [0]
+        for i in range(len(new_split_sizes)):
+            offsets.append(offsets[i] + new_split_sizes[i])
+        self.offsets = offsets
 
+    prune_in_channels = prune_out_channels
+        
+    
+
+class ReshapePruner(DummyPruner):
+    pass
 
 class ElementWisePruner(DummyPruner):
     pass
@@ -77,6 +133,8 @@ class ElementWisePruner(DummyPruner):
 TORCH_CONV = nn.modules.conv._ConvNd
 TORCH_BATCHNORM = nn.modules.batchnorm._BatchNorm
 TORCH_LAYERNORM = nn.modules.normalization.LayerNorm
+TORCH_GROUPNORM = nn.GroupNorm
+TORCH_INSTANCENORM = nn.modules.instancenorm._InstanceNorm
 TORCH_PRELU = nn.PReLU
 TORCH_LINEAR = nn.Linear
 TORCH_EMBED = nn.Embedding
@@ -104,6 +162,9 @@ class OPTYPE(IntEnum):
     PARAMETER = 11  # nn.Parameter
     MHA = 12
     LSTM = 13
+    RESHAPE = 14
+    GN = 15  # nn.GroupNorm
+    IN = 16  # nn.InstanceNorm
 
 
 def module2type(module):
@@ -134,6 +195,12 @@ def module2type(module):
         return OPTYPE.MHA
     elif isinstance(module, TORCH_LSTM):
         return OPTYPE.LSTM
+    elif isinstance(module, TORCH_GROUPNORM):
+        return OPTYPE.GN
+    elif isinstance(module, TORCH_INSTANCENORM):
+        return OPTYPE.IN
+    elif isinstance(module, _ReshapeOp):
+        return OPTYPE.RESHAPE
     else:
         return OPTYPE.ELEMENTWISE
 
@@ -161,8 +228,14 @@ def type2class(op_type):
         return TORCH_PARAMETER
     elif op_type == OPTYPE.MHA:
         return TORCH_MHA
+    elif op_type == OPTYPE.GN:
+        return TORCH_GROUPNORM
+    elif op_type == OPTYPE.IN:
+        return TORCH_INSTANCENORM
     elif op_type == OPTYPE.LSTM:
         return TORCH_LSTM
+    elif OPTYPE == OPTYPE.RESHAPE:
+        return _ReshapeOp
     else:
         return _ElementWiseOp
 

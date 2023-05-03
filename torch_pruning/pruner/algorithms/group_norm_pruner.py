@@ -1,9 +1,10 @@
+import torch
+import math
 from .metapruner import MetaPruner
 from .scheduler import linear_scheduler
 from .. import function
-import torch
-import math
 from ..._helpers import _FlattenIndexMapping
+
 
 class GroupNormPruner(MetaPruner):
     def __init__(
@@ -12,6 +13,7 @@ class GroupNormPruner(MetaPruner):
         example_inputs,
         importance,
         reg=1e-4,
+        alpha=4,
         iterative_steps=1,
         iterative_sparsity_scheduler=linear_scheduler,
         ch_sparsity=0.5,
@@ -44,7 +46,8 @@ class GroupNormPruner(MetaPruner):
             output_transform=output_transform,
         )
         self.reg = reg
-        self.groups = list(self.get_all_groups())
+        self.alpha = alpha
+        self.groups = list(self.DG.get_all_groups())
         self.soft_keeping_ratio = soft_keeping_ratio
         self.cnt = 0
 
