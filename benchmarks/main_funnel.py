@@ -57,14 +57,14 @@ def progressive_pruning(pruner, model, example_inputs, speed_up, global_speed_up
     model.eval()
     if not global_speed_up:
         assert tail_modules != []
-        base_ops, _ = get_model_complexity_info(model, input_res=tuple(example_inputs.shape[1:]), print_per_layer_stat=False, as_strings=False, ignore_modules=tail_modules)
+        base_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs, ignore_modules=tail_modules)
     else:
         base_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
     current_speed_up = 1
     while current_speed_up < speed_up:
         pruner.step()
         if not global_speed_up:
-            pruned_ops, _ = get_model_complexity_info(model, input_res=tuple(example_inputs.shape[1:]), print_per_layer_stat=False, as_strings=False, ignore_modules=tail_modules)
+            pruned_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs, ignore_modules=tail_modules)
         else:
             pruned_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
         current_speed_up = float(base_ops) / pruned_ops
@@ -110,7 +110,8 @@ def train_model(
     device=None,
 
     # Training will terminate if the target accuracy is achieved
-    target_accuracy=None
+    target_accuracy=None,
+    last_epoch=-1
 ):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,10 +121,17 @@ def train_model(
         momentum=0.9,
         weight_decay=weight_decay if regularizer is None else 0.0,
     )
-    milestones = [int(ms) for ms in lr_decay_milestones.split(",")]
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=milestones, gamma=lr_decay_gamma
-    )
+    if lr_decay_milestones != "":
+        milestones = [int(ms) for ms in lr_decay_milestones.split(",")]
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=milestones, gamma=lr_decay_gamma
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=lr_decay_gamma
+        )
+    for i in range(last_epoch + 1):
+        scheduler.step()
     model.to(device)
     best_acc = -1
     for epoch in range(epochs):
@@ -175,10 +183,10 @@ def train_model(
 
         if target_accuracy != None:
             if acc > target_accuracy:
-                return epoch
+                return epoch + 1
         
     args.logger.info("Best Acc=%.4f" % (best_acc))
-    return epoch
+    return epoch + 1
 
 
 def get_pruner(model, example_inputs, ch_sparsity_dict={}):
@@ -342,6 +350,7 @@ def main():
                 ignore_modules.append(m)
     
         ori_ops_head, ori_size_head = get_model_complexity_info(model, input_res=input_size[1:], print_per_layer_stat=True, verbose=True, as_strings=False, ignore_modules=ignore_modules)
+        ori_ops_head, ori_size_head = tp.utils.count_ops_and_params(model, example_inputs=example_inputs, ignore_modules=ignore_modules)
 
         pruner = get_pruner(model, example_inputs=example_inputs, ch_sparsity_dict=ch_sparsity_dict)
 
@@ -370,6 +379,7 @@ def main():
         model.eval()
         args.logger.info("Pruning...")
         if args.max_accuracy_drop != None:
+            last_epoch = -1
             while True:
                 last_model = model
                 progressive_pruning_2(pruner, model, test_loader, device=args.device, min_tolerable_accuracy=ori_acc - args.max_accuracy_drop)
@@ -378,16 +388,19 @@ def main():
                 finetune_epochs = train_model(
                     model,
                     epochs=args.total_epochs,
-                    lr=0.001,
-                    lr_decay_milestones=args.lr_decay_milestones,
+                    lr=args.lr,
+                    lr_decay_milestones="",
+                    lr_decay_gamma=0.95,
                     train_loader=train_loader,
                     test_loader=test_loader,
                     device=args.device,
                     save_state_dict_only=True,
                     # save_as=funnel_pth,
-                    target_accuracy=ori_acc - args.max_accuracy_drop
+                    target_accuracy=ori_acc - args.max_accuracy_drop,
+                    # last_epoch=last_epoch
                 )
-                if finetune_epochs == args.total_epochs - 1:
+                last_epoch += finetune_epochs
+                if finetune_epochs == args.total_epochs:
                     # finetuning was not able to recover the original accuracy
                     # so switch back to the last model before last pruning step
                     model = last_model
@@ -399,6 +412,7 @@ def main():
         pruned_ops, pruned_size = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
 
         pruned_ops_head, pruned_size_head = get_model_complexity_info(model, input_res=input_size[1:], print_per_layer_stat=True, verbose=True, as_strings=False, ignore_modules=ignore_modules)
+        pruned_ops_head, pruned_size_head = tp.utils.count_ops_and_params(model, example_inputs=example_inputs, ignore_modules=ignore_modules)
 
         pruned_acc, pruned_val_loss = eval(model, test_loader, device=args.device)
         
