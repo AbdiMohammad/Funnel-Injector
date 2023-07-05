@@ -16,6 +16,8 @@ import engine.utils as utils
 
 from ptflops import get_model_complexity_info
 
+import numpy as np
+
 parser = argparse.ArgumentParser()
 
 # Basic options
@@ -36,6 +38,7 @@ parser.add_argument("--method", type=str, default=None)
 parser.add_argument("--speed-up", type=float, default=2)
 parser.add_argument("--global-speed-up", action="store_true", default=False)
 parser.add_argument("--max-accuracy-drop", type=float, default=None)
+parser.add_argument("--acc-drop-iters", type=int, default=1)
 parser.add_argument("--max-sparsity", type=float, default=1.0)
 parser.add_argument("--soft-keeping-ratio", type=float, default=0.0)
 parser.add_argument("--reg", type=float, default=5e-4)
@@ -379,32 +382,34 @@ def main():
         model.eval()
         args.logger.info("Pruning...")
         if args.max_accuracy_drop != None:
-            last_epoch = -1
-            while True:
-                last_model = model
-                progressive_pruning_2(pruner, model, test_loader, device=args.device, min_tolerable_accuracy=ori_acc - args.max_accuracy_drop)
-                # funnel_pth = "funnel_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.max_accuracy_drop)
-                # funnel_pth = os.path.join( os.path.join(args.output_dir, funnel_pth) )
-                finetune_epochs = train_model(
-                    model,
-                    epochs=args.total_epochs,
-                    lr=args.lr,
-                    lr_decay_milestones="",
-                    lr_decay_gamma=0.95,
-                    train_loader=train_loader,
-                    test_loader=test_loader,
-                    device=args.device,
-                    save_state_dict_only=True,
-                    # save_as=funnel_pth,
-                    target_accuracy=ori_acc - args.max_accuracy_drop,
-                    # last_epoch=last_epoch
-                )
-                last_epoch += finetune_epochs
-                if finetune_epochs == args.total_epochs:
-                    # finetuning was not able to recover the original accuracy
-                    # so switch back to the last model before last pruning step
-                    model = last_model
-                    break            
+            acc_drop_steps = np.geomspace(0.0001, args.max_accuracy_drop, num=args.acc_drop_iters)[1:]
+            for acc_drop_step in acc_drop_steps:
+                last_epoch = -1
+                while True:
+                    last_model = model
+                    progressive_pruning_2(pruner, model, test_loader, device=args.device, min_tolerable_accuracy=ori_acc - acc_drop_step)
+                    # funnel_pth = "funnel_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.max_accuracy_drop)
+                    # funnel_pth = os.path.join( os.path.join(args.output_dir, funnel_pth) )
+                    finetune_epochs = train_model(
+                        model,
+                        epochs=args.total_epochs,
+                        lr=args.lr,
+                        lr_decay_milestones="",
+                        lr_decay_gamma=0.95,
+                        train_loader=train_loader,
+                        test_loader=test_loader,
+                        device=args.device,
+                        save_state_dict_only=True,
+                        # save_as=funnel_pth,
+                        target_accuracy=ori_acc - acc_drop_step,
+                        # last_epoch=last_epoch
+                    )
+                    last_epoch += finetune_epochs
+                    if finetune_epochs == args.total_epochs:
+                        # finetuning was not able to recover the original accuracy
+                        # so switch back to the last model before last pruning step
+                        model = last_model
+                        break            
         else:
             progressive_pruning(pruner, model, example_inputs=example_inputs, speed_up=args.speed_up, global_speed_up=args.global_speed_up, tail_modules=ignore_modules)
         del pruner # remove reference
