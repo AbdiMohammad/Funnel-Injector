@@ -1,10 +1,12 @@
 from . import (
+    resnet_tiny_proj,
     densenet,
     googlenet,
     inceptionv4,
     inceptionv3,
     mobilenetv2,
     preactresnet,
+    resnet_proj,
     resnet_tiny,
     resnet,
     resnext,
