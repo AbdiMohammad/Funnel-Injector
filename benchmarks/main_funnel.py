@@ -408,8 +408,8 @@ def main():
                     if finetune_epochs == args.total_epochs:
                         # finetuning was not able to recover the original accuracy
                         # so switch back to the last model before last pruning step
-                        model = last_model
-                        break            
+                        break
+            model = last_model
         else:
             progressive_pruning(pruner, model, example_inputs=example_inputs, speed_up=args.speed_up, global_speed_up=args.global_speed_up, tail_modules=ignore_modules)
         del pruner # remove reference
