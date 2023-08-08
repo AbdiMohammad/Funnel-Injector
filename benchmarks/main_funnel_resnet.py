@@ -18,6 +18,7 @@ from ptflops import get_model_complexity_info
 
 import numpy as np
 import copy
+from collections import OrderedDict
 
 parser = argparse.ArgumentParser()
 
@@ -193,7 +194,7 @@ def train_model(
     return epoch + 1
 
 
-def get_pruner(model, example_inputs, ch_sparsity_dict={}):
+def get_pruner(model, example_inputs, ch_sparsity_dict={}, customized_pruners=None):
     sparsity_learning = False
     if args.method == "random":
         imp = tp.importance.RandomImportance()
@@ -241,6 +242,7 @@ def get_pruner(model, example_inputs, ch_sparsity_dict={}):
         ch_sparsity_dict=ch_sparsity_dict,
         max_ch_sparsity=args.max_sparsity,
         ignored_layers=ignored_layers,
+        customized_pruners=customized_pruners,
         unwrapped_parameters=unwrapped_parameters,
     )
     return pruner
@@ -320,21 +322,20 @@ def main():
         ori_ops, ori_size = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
         ori_acc, ori_val_loss = eval(model, test_loader, device=args.device)
 
-        ch_sparsity_dict = {}
-        ch_sparsity_dict[model.get_submodule("layer1.0.conv1")] = 1
-        ch_sparsity_dict[model.get_submodule("layer1.0.conv2")] = 2
-        ch_sparsity_dict[model.get_submodule("layer1.1.conv1")] = 3
-        ch_sparsity_dict[model.get_submodule("layer1.1.conv2")] = 4
-        ch_sparsity_dict[model.get_submodule("layer2.0.conv1")] = 5
-        ch_sparsity_dict[model.get_submodule("layer2.0.conv2")] = 6
-        ch_sparsity_dict[model.get_submodule("layer2.1.conv1")] = 7
-        ch_sparsity_dict[model.get_submodule("layer2.1.conv2")] = 8
+        ch_sparsity_dict = OrderedDict()
+        for layer_idx in range(2):
+            for block_idx in range(2):
+                for conv_idx in range(2):
+                    ch_sparsity_dict[model.get_submodule(f'layer{layer_idx + 1}.{block_idx}.conv{conv_idx + 1}')] = layer_idx * 4 + block_idx * 2 + conv_idx + 1
+
         for module in ch_sparsity_dict.keys():
             ch_sparsity_dict[module] /= len(ch_sparsity_dict)
-        ch_sparsity_dict[model.get_submodule("layer1.0.shortcut.0")] = ch_sparsity_dict[model.get_submodule("layer1.0.conv2")]
-        ch_sparsity_dict[model.get_submodule("layer1.1.shortcut.0")] = ch_sparsity_dict[model.get_submodule("layer1.1.conv2")]
-        ch_sparsity_dict[model.get_submodule("layer2.0.shortcut.0")] = ch_sparsity_dict[model.get_submodule("layer2.0.conv2")]
-        ch_sparsity_dict[model.get_submodule("layer2.1.shortcut.0")] = ch_sparsity_dict[model.get_submodule("layer2.1.conv2")]
+
+        for layer_idx in range(2):
+            for block_idx in range(2):
+                ch_sparsity_dict[model.get_submodule(f'layer{layer_idx + 1}.{block_idx}.shortcut')] = ch_sparsity_dict[model.get_submodule(f'layer{layer_idx + 1}.{block_idx}.conv2')]
+
+        # args.max_sparsity = 1 - (1 / 128)
 
         # ch_sparsity_dict = {}
         # conv_idx = 0
@@ -367,6 +368,12 @@ def main():
         # ch_sparsity_dict[model.get_submodule("layer2")] = 1
         # ch_sparsity_dict[model.get_submodule("layer3")] = 1
 
+        for m in model.modules():
+            if 'DropLayer'in str(m):
+                drop_layer_pruner = registry.models.cifar.resnet_drop.DropLayerPruner()
+                customized_pruners = {registry.models.cifar.resnet_drop.DropLayer: drop_layer_pruner}
+                break
+
         ignore_modules = []
         for m in model.modules():
             if m not in ch_sparsity_dict.keys():
@@ -375,7 +382,7 @@ def main():
         ori_ops_head, ori_size_head = get_model_complexity_info(model, input_res=input_size[1:], print_per_layer_stat=True, verbose=True, as_strings=False, ignore_modules=ignore_modules)
         ori_ops_head, ori_size_head = tp.utils.count_ops_and_params(model, example_inputs=example_inputs, ignore_modules=ignore_modules)
 
-        pruner = get_pruner(model, example_inputs=example_inputs, ch_sparsity_dict=ch_sparsity_dict)
+        pruner = get_pruner(model, example_inputs=example_inputs, ch_sparsity_dict=ch_sparsity_dict, customized_pruners=customized_pruners)
 
         # 0. Sparsity Learning
         if args.sparsity_learning:
@@ -409,9 +416,21 @@ def main():
                 while True:
                     del last_model
                     last_model = copy.deepcopy(model)
+                    for m in reversed(ch_sparsity_dict.keys()):
+                        if isinstance(m, nn.Conv2d):
+                            if m.weight.shape[0] == 1:
+                                print("No more space for pruning")
+                                break
                     progressive_pruning_2(pruner, model, test_loader, device=args.device, min_tolerable_accuracy=ori_acc - acc_drop_step)
                     # funnel_pth = "funnel_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.max_accuracy_drop)
                     # funnel_pth = os.path.join( os.path.join(args.output_dir, funnel_pth) )
+                    for m in ch_sparsity_dict.keys():
+                        if isinstance(m, torch.nn.Conv2d):
+                            for name, module in model.named_modules():
+                                if module == m:
+                                    ori_module = ori_model.get_submodule(name)
+                                    print(f"{name}: {module.weight.shape[0]} / {ori_module.weight.shape[0]} = {module.weight.shape[0] / ori_module.weight.shape[0]}")
+                                    break
                     finetune_epochs = train_model(
                         model,
                         epochs=args.total_epochs,
@@ -430,6 +449,7 @@ def main():
                     if finetune_epochs == args.total_epochs:
                         # finetuning was not able to recover the original accuracy
                         # so switch back to the last model before last pruning step
+                        print("Cannot recover accuracy")
                         break
             model = copy.deepcopy(last_model)
         else:

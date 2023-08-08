@@ -16,6 +16,21 @@ NORMALIZE_DICT = {
 
 
 MODEL_DICT = {
+    'resnet18_drop': models.cifar.resnet_drop.resnet18,
+    'resnet34_drop': models.cifar.resnet_drop.resnet34,
+    'resnet50_drop': models.cifar.resnet_drop.resnet50,
+    'resnet101_drop': models.cifar.resnet_drop.resnet101,
+    'resnet152_drop': models.cifar.resnet_drop.resnet152,
+
+    #'resnet14_drop': models.cifar.resnet_tiny_drop.resnet14,
+    'resnet20_drop': models.cifar.resnet_tiny_drop.resnet20,
+    'resnet32_drop': models.cifar.resnet_tiny_drop.resnet32,
+    'resnet44_drop': models.cifar.resnet_tiny_drop.resnet44,
+    'resnet56_drop': models.cifar.resnet_tiny_drop.resnet56,
+    'resnet110_drop': models.cifar.resnet_tiny_drop.resnet110,
+    #'resnet8x4_drop': models.cifar.resnet_tiny_drop.resnet8x4,
+    #'resnet32x4_drop': models.cifar.resnet_tiny_drop.resnet32x4,
+    
     'resnet18_proj': models.cifar.resnet_proj.resnet18,
     'resnet34_proj': models.cifar.resnet_proj.resnet34,
     'resnet50_proj': models.cifar.resnet_proj.resnet50,

@@ -82,7 +82,7 @@ class BasePruningFunc(ABC):
         return layer
 
     def _prune_parameter_and_grad(self, weight, keep_idxs, pruning_dim):
-        pruned_weight = torch.nn.Parameter(torch.index_select(weight, pruning_dim, torch.LongTensor(keep_idxs).to(weight.device)))
+        pruned_weight = torch.nn.Parameter(torch.index_select(weight, pruning_dim, torch.LongTensor(keep_idxs).to(weight.device)), requires_grad=weight.requires_grad)
         if weight.grad is not None:
             pruned_weight.grad = torch.index_select(weight.grad, pruning_dim, torch.LongTensor(keep_idxs).to(weight.device))
         return pruned_weight.to(weight.device)

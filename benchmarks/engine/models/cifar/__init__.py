@@ -1,4 +1,7 @@
 from . import (
+    resnet_drop,
+    resnet_proj,
+    resnet_tiny_drop,
     resnet_tiny_proj,
     densenet,
     googlenet,
@@ -6,7 +9,6 @@ from . import (
     inceptionv3,
     mobilenetv2,
     preactresnet,
-    resnet_proj,
     resnet_tiny,
     resnet,
     resnext,

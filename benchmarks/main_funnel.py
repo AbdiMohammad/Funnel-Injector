@@ -17,6 +17,7 @@ import engine.utils as utils
 from ptflops import get_model_complexity_info
 
 import numpy as np
+import copy
 
 parser = argparse.ArgumentParser()
 
@@ -293,6 +294,9 @@ def main():
         args.logger.info("Loading model from {restore}".format(restore=args.restore))
     model = model.to(args.device)
 
+    # @!
+    import copy
+    ori_model = copy.deepcopy(model)
 
     ######################################################
     # Training / Pruning / Testing
@@ -382,14 +386,28 @@ def main():
         model.eval()
         args.logger.info("Pruning...")
         if args.max_accuracy_drop != None:
+            last_model = None
             acc_drop_steps = np.geomspace(0.0001, args.max_accuracy_drop, num=args.acc_drop_iters)[1:]
             for acc_drop_step in acc_drop_steps:
                 last_epoch = -1
                 while True:
-                    last_model = model
+                    del last_model
+                    last_model = copy.deepcopy(model)
+                    for m in reversed(ch_sparsity_dict.keys()):
+                        if isinstance(m, nn.Conv2d):
+                            if m.weight.shape[0] == 1:
+                                print("No more space for pruning")
+                                break
                     progressive_pruning_2(pruner, model, test_loader, device=args.device, min_tolerable_accuracy=ori_acc - acc_drop_step)
                     # funnel_pth = "funnel_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.max_accuracy_drop)
                     # funnel_pth = os.path.join( os.path.join(args.output_dir, funnel_pth) )
+                    for m in ch_sparsity_dict.keys():
+                        if isinstance(m, torch.nn.Conv2d):
+                            for name, module in model.named_modules():
+                                if module == m:
+                                    ori_module = ori_model.get_submodule(name)
+                                    print(f"{name}: {module.weight.shape[0]} / {ori_module.weight.shape[0]} = {module.weight.shape[0] / ori_module.weight.shape[0]}")
+                                    break
                     finetune_epochs = train_model(
                         model,
                         epochs=args.total_epochs,
@@ -409,7 +427,7 @@ def main():
                         # finetuning was not able to recover the original accuracy
                         # so switch back to the last model before last pruning step
                         break
-            model = last_model
+            model = copy.deepcopy(last_model)
         else:
             progressive_pruning(pruner, model, example_inputs=example_inputs, speed_up=args.speed_up, global_speed_up=args.global_speed_up, tail_modules=ignore_modules)
         del pruner # remove reference
