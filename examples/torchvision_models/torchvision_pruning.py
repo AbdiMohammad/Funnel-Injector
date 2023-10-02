@@ -163,7 +163,12 @@ if __name__ == "__main__":
             ignored_layers.extend([model.head.classification_head.cls_logits, model.head.regression_head.bbox_reg])
         # For ViT: Rounding the number of channels to the nearest multiple of num_heads
         round_to = None
-        if isinstance( model, VisionTransformer): round_to = model.encoder.layers[0].num_heads
+        channel_groups = {}
+        if isinstance( model, VisionTransformer): 
+            for m in model.modules():
+                if isinstance(m, nn.MultiheadAttention):
+                    channel_groups[m] = m.num_heads
+            #round_to = model.encoder.layers[0].num_heads
 
         #########################################
         # (Optional) Register unwrapped nn.Parameters 
@@ -191,9 +196,11 @@ if __name__ == "__main__":
             importance=importance,
             iterative_steps=1,
             ch_sparsity=0.5,
+            global_pruning=False,
             round_to=round_to,
             unwrapped_parameters=unwrapped_parameters,
             ignored_layers=ignored_layers,
+            channel_groups=channel_groups,
         )
 
 
@@ -203,6 +210,16 @@ if __name__ == "__main__":
         print("==============Before pruning=================")
         print("Model Name: {}".format(model_name))
         print(model)
+
+        layer_channel_cfg = {}
+        for module in model.modules():
+            if module not in pruner.ignored_layers:
+                #print(module)
+                if isinstance(module, nn.Conv2d):
+                    layer_channel_cfg[module] = module.out_channels
+                elif isinstance(module, nn.Linear):
+                    layer_channel_cfg[module] = module.out_features
+
         pruner.step()
         if isinstance(
             model, VisionTransformer
@@ -223,7 +240,18 @@ if __name__ == "__main__":
             if output_transform:
                 out = output_transform(out)
             print("{} Pruning: ".format(model_name))
-            print("  Params: %s => %s" % (ori_size, tp.utils.count_params(model)))
+            params_after_prune = tp.utils.count_params(model)
+            print("  Params: %s => %s" % (ori_size, params_after_prune))
+            
+            if 'rcnn' not in model_name and model_name!='ssdlite320_mobilenet_v3_large': # RCNN may return 0 proposals, making some layers unreachable during tracing.
+                for module, ch in layer_channel_cfg.items():
+                    if isinstance(module, nn.Conv2d):
+                        #print(module.out_channels, layer_channel_cfg[module])
+                        assert int(0.5*layer_channel_cfg[module]) == module.out_channels
+                    elif isinstance(module, nn.Linear):
+                        #print(module.out_features, layer_channel_cfg[module])
+                        assert int(0.5*layer_channel_cfg[module]) == module.out_features
+
             if isinstance(out, (dict,list,tuple)):
                 print("  Output:")
                 for o in tp.utils.flatten_as_list(out):
@@ -235,7 +263,7 @@ if __name__ == "__main__":
     successful = []
     unsuccessful = []
     for model_name, entry in entries.items():
-        if 'swin' in model_name.lower(): # stuck
+        if 'swin' in model_name.lower() or 'raft' in model_name.lower() or 'shufflenet' in model_name.lower(): # stuck
             unsuccessful.append(model_name)
             continue
 
@@ -283,3 +311,9 @@ if __name__ == "__main__":
         print("")
         print("Unsuccessful Pruning: %d Models\n"%(len(unsuccessful)), unsuccessful)
         sys.stdout.flush()
+
+print("Finished!")
+
+print("Successful Pruning: %d Models\n"%(len(successful)), successful)
+print("")
+print("Unsuccessful Pruning: %d Models\n"%(len(unsuccessful)), unsuccessful)

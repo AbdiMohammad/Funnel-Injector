@@ -12,10 +12,18 @@ import numpy as np
 import torch.nn as nn
 import torch
 
+try:
+    import timm
+    has_timm = True
+except:
+    has_timm = False
+
 @torch.no_grad()
-def count_ops_and_params(model, example_inputs, ignore_modules=[]):
+def count_ops_and_params(model, example_inputs, ignore_modules=[], layer_wise=False):
     global CUSTOM_MODULES_MAPPING
-    # model = copy.deepcopy(model)
+    # FIXME: Since we need to ignore the modules addressed by their reference in the original model, we needed to comment out deep copying before. Check if ignoring works when deep copying.
+    ori_model = model 
+    model = copy.deepcopy(model) # deepcopy to avoid changing the original model
     flops_model = add_flops_counting_methods(model)
     flops_model.eval()
     flops_model.start_flops_count(ost=sys.stdout, verbose=False,
@@ -26,11 +34,18 @@ def count_ops_and_params(model, example_inputs, ignore_modules=[]):
         _ = flops_model(**example_inputs)
     else:
         _ = flops_model(example_inputs)
-    flops_count, params_count = flops_model.compute_average_flops_cost()
+    flops_count, params_count, _layer_flops, _layer_params = flops_model.compute_average_flops_cost()
+    layer_flops = {}
+    layer_params = {}
+    for ori_m, m in zip(ori_model.modules(), model.modules()):
+        layer_flops[ori_m] = _layer_flops.get(m)
+        layer_params[ori_m] = _layer_params.get(m)
+
     flops_model.stop_flops_count()
     CUSTOM_MODULES_MAPPING = {}
+    if layer_wise:
+        return flops_count, params_count, layer_flops, layer_params
     return flops_count, params_count
-
 
 def empty_flops_counter_hook(module, input, output):
     module.__flops__ += 0
@@ -71,6 +86,12 @@ def bn_flops_counter_hook(module, input, output):
         batch_flops *= 2
     module.__flops__ += int(batch_flops)
 
+def ln_flops_counter_hook(module, input, output):
+    input = input[0]
+    batch_flops = np.prod(input.shape)
+    if module.elementwise_affine:
+        batch_flops *= 2
+    module.__flops__ += int(batch_flops)
 
 def conv_flops_counter_hook(conv_module, input, output):
     # Can have multiple inputs, getting the first one
@@ -213,17 +234,14 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
 
     # Q scaling
     flops += qlen * qdim
-
     # Initial projections
     flops += (
         (qlen * qdim * qdim)  # QW
         + (klen * kdim * kdim)  # KW
         + (vlen * vdim * vdim)  # VW
     )
-
     if multihead_attention_module.in_proj_bias is not None:
         flops += (qlen + klen + vlen) * qdim
-
     # attention heads: scale, matmul, softmax, matmul
     qk_head_dim = qdim // num_heads
     v_head_dim = vdim // num_heads
@@ -233,14 +251,53 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
         + (qlen * klen)  # softmax
         + (qlen * klen * v_head_dim)  # AV
     )
-
     flops += num_heads * head_flops
-
     # final projection, bias is always enabled
     flops += qlen * vdim * (vdim + 1)
-
     flops *= batch_size
     multihead_attention_module.__flops__ += int(flops)
+
+def timm_multihead_attention_counter_hook(multihead_attention_module, input, output):
+    flops = 0
+    
+    q, k, v = input[0], input[0], input[0]
+    input_dim = input[0].shape[2]
+    input_len = input[0].shape[1]
+    batch_size = input[0].shape[0]
+
+    kdim = qdim = vdim = multihead_attention_module.qkv.out_features//3
+    qlen = klen = vlen = input_len
+
+    num_heads = multihead_attention_module.num_heads
+    assert qdim == multihead_attention_module.head_dim * multihead_attention_module.num_heads
+    
+    flops = 0
+    # Q scaling
+    flops += qlen * qdim
+    # Initial projections
+    flops += (
+        (qlen * input_dim * qdim)  # QW
+        + (klen * input_dim * kdim)  # KW
+        + (vlen * input_dim * vdim)  # VW
+    )
+
+    if multihead_attention_module.qkv.bias is not None:
+        flops += (qlen + klen + vlen) * qdim
+    # attention heads: scale, matmul, softmax, matmul
+    qk_head_dim = qdim // num_heads
+    v_head_dim = vdim // num_heads
+
+    head_flops = (
+        (qlen * klen * qk_head_dim)  # QK^T
+        + (qlen * klen)  # softmax
+        + (qlen * klen * v_head_dim)  # AV
+    )
+    flops += num_heads * head_flops
+    # final projection, bias is always enabled
+    flops += qlen * vdim * (vdim + 1)
+    flops *= batch_size
+    multihead_attention_module.__flops__ += int(flops)
+
 
 
 CUSTOM_MODULES_MAPPING = {}
@@ -278,6 +335,7 @@ MODULES_MAPPING = {
     nn.InstanceNorm2d: bn_flops_counter_hook,
     nn.InstanceNorm3d: bn_flops_counter_hook,
     nn.GroupNorm: bn_flops_counter_hook,
+    nn.LayerNorm: ln_flops_counter_hook,
     # FC
     nn.Linear: linear_flops_counter_hook,
     # Upscale
@@ -296,6 +354,13 @@ MODULES_MAPPING = {
     nn.MultiheadAttention: multihead_attention_counter_hook
 }
 
+if has_timm:
+    MODULES_MAPPING.update(
+        {
+            timm.models.vision_transformer.Attention: timm_multihead_attention_counter_hook,
+        }
+    )
+
 if hasattr(nn, 'GELU'):
     MODULES_MAPPING[nn.GELU] = relu_flops_counter_hook
 
@@ -305,13 +370,15 @@ from functools import partial
 import torch.nn as nn
 import copy
 
-def accumulate_flops(self):
+def accumulate_flops(self, layer_flops):
     if is_supported_instance(self):
+        layer_flops[self] = self.__flops__
         return self.__flops__
     else:
         sum = 0
         for m in self.children():
-            sum += m.accumulate_flops()
+            sum += m.accumulate_flops(layer_flops)
+        layer_flops[self] = sum
         return sum
 
 
@@ -326,7 +393,7 @@ def accumulate_params(self):
 
 
 def get_model_parameters_number(model):
-    params_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    params_num = sum(p.numel() for p in model.parameters())
     return params_num
 
 
@@ -343,7 +410,6 @@ def add_flops_counting_methods(net_main_module):
 
     return net_main_module
 
-
 def compute_average_flops_cost(self):
     """
     A method that will be available after add_flops_counting_methods() is called
@@ -354,11 +420,16 @@ def compute_average_flops_cost(self):
     for m in self.modules():
         m.accumulate_flops = accumulate_flops.__get__(m)
 
-    flops_sum = self.accumulate_flops()
+    layer_flops = {}
+    flops_sum = self.accumulate_flops(layer_flops)
 
     for m in self.modules():
         if hasattr(m, 'accumulate_flops'):
             del m.accumulate_flops
+
+    layer_params = {}
+    for m in self.modules():
+        layer_params[m] = get_model_parameters_number(m)
 
     for m in self.modules():
         m.accumulate_params = accumulate_params.__get__(m)
@@ -370,7 +441,7 @@ def compute_average_flops_cost(self):
             del m.accumulate_params
 
     # params_sum = get_model_parameters_number(self)
-    return flops_sum / self.__batch_counter__, params_sum
+    return flops_sum / self.__batch_counter__, params_sum, layer_flops, layer_params
 
 
 def start_flops_count(self, **kwargs):
